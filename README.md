@@ -48,12 +48,37 @@ sudo ./configure_headless_sunshine.sh
 ```
 
 The script will:
-- Download and install Sunshine (v2025.1014.193231)
+- Download and install Sunshine (latest **stable** release by default), verifying the
+  package SHA-256 against GitHub's published asset digest before installing
 - Install all required system dependencies
 - Configure GRUB kernel parameters for NVIDIA DRM modesetting
 - Set up Xorg with virtual display support
 - Configure GDM for X11 and autologin
 - Create autostart entries for display initialization and Sunshine
+
+### Configuration options
+
+All optional — set as environment variables when invoking the script:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SUNSHINE_VERSION` | latest stable | Pin a specific Sunshine release tag (e.g. `v2026.516.143833`) for reproducible installs. |
+| `SUNSHINE_SHA256` | from GitHub asset metadata | Override the expected `.deb` SHA-256 (e.g. for an air-gapped mirror). |
+| `SUNSHINE_DEB_ASSET` | `sunshine-ubuntu-24.04-arm64.deb` | Release asset to install (change only for a different Ubuntu/arch). |
+| `CONFIGURE_FIREWALL` | `0` | Set `1` to restrict Sunshine's ports with `ufw` (requires `FIREWALL_ALLOW_CIDRS`). |
+| `FIREWALL_ALLOW_CIDRS` | _(empty)_ | Comma-separated networks allowed to reach Sunshine, e.g. `192.168.1.0/24,100.64.0.0/10`. |
+
+Examples:
+
+```bash
+# Pin a specific Sunshine version
+sudo SUNSHINE_VERSION=v2026.516.143833 ./configure_headless_sunshine.sh
+
+# Restrict Sunshine to the LAN and Tailscale
+sudo CONFIGURE_FIREWALL=1 \
+     FIREWALL_ALLOW_CIDRS="192.168.1.0/24,100.64.0.0/10" \
+     ./configure_headless_sunshine.sh
+```
 
 ### 3. Verify the configuration
 
@@ -406,6 +431,22 @@ Sunshine uses NVIDIA NVENC for hardware-accelerated H.264/H.265 encoding:
 
 ## Security Considerations
 
+### Package integrity
+
+The Sunshine `.deb` is installed from the official
+[LizardByte/Sunshine](https://github.com/LizardByte/Sunshine) GitHub releases, and its
+SHA-256 is verified against GitHub's published asset digest **before** installation. By
+default the script tracks the latest **stable** release (not pre-releases); pin a known-good
+release with `SUNSHINE_VERSION` (and optionally `SUNSHINE_SHA256`) for reproducible, auditable
+installs.
+
+### Set Sunshine credentials immediately
+
+On first launch the Sunshine web UI has **no authentication until you create a username and
+password** — the first client to reach `https://<host>:47990/` claims the admin account. Set
+your credentials immediately after the first boot, and/or restrict access with the firewall
+option below.
+
 ### Autologin
 
 The script enables autologin for convenience. If this is a security concern:
@@ -413,14 +454,28 @@ The script enables autologin for convenience. If this is a security concern:
 2. Set `AutomaticLoginEnable=false`
 3. Restart GDM: `sudo systemctl restart gdm3`
 
-### Sunshine Access
+### Restricting network access (firewall)
 
-Sunshine requires pairing with client devices. Access is controlled by:
-- PIN-based pairing process
-- HTTPS for web UI (if configured)
-- Network isolation (only accessible on local network by default)
+By default Sunshine listens on all interfaces. Re-run the script with `CONFIGURE_FIREWALL=1`
+and `FIREWALL_ALLOW_CIDRS` to restrict its ports to specific networks (the rule set also keeps
+SSH reachable so you are not locked out):
 
-For additional security, configure firewall rules to restrict Sunshine ports (47984-47990).
+```bash
+sudo CONFIGURE_FIREWALL=1 \
+     FIREWALL_ALLOW_CIDRS="192.168.1.0/24,100.64.0.0/10" \
+     ./configure_headless_sunshine.sh
+```
+
+Sunshine's default ports (base port 47989):
+
+| Port(s) | Protocol | Purpose |
+|---------|----------|---------|
+| 47984, 47989, 47990, 48010 | TCP | HTTPS, HTTP, Web UI, RTSP |
+| 47998, 47999, 48000, 48002 | UDP | Video, Control, Audio, Mic |
+
+Pairing is PIN-based and the web UI is HTTPS (self-signed). See the
+[Sunshine documentation](https://docs.lizardbyte.dev/projects/sunshine/) for the authoritative
+port reference.
 
 ## Contributing
 

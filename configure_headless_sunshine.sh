@@ -4,6 +4,18 @@
 
 set -euo pipefail
 
+# --- Configuration (override via environment) ---------------------------------
+# Sunshine .deb asset to install (matches the DGX Spark: Ubuntu 24.04 / ARM64).
+SUNSHINE_DEB_ASSET="${SUNSHINE_DEB_ASSET:-sunshine-ubuntu-24.04-arm64.deb}"
+# Pin a specific Sunshine release tag (e.g. v2026.516.143833). Default: latest stable.
+SUNSHINE_VERSION="${SUNSHINE_VERSION:-}"
+# Expected SHA-256 of the .deb. Default: taken from the GitHub asset metadata.
+SUNSHINE_SHA256="${SUNSHINE_SHA256:-}"
+# Opt-in firewall: set CONFIGURE_FIREWALL=1 and FIREWALL_ALLOW_CIDRS to restrict
+# Sunshine's ports to specific networks (LAN/Tailscale). Default: off.
+CONFIGURE_FIREWALL="${CONFIGURE_FIREWALL:-0}"
+FIREWALL_ALLOW_CIDRS="${FIREWALL_ALLOW_CIDRS:-}"
+
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
     echo "This script must be run as root (try: sudo $0)" >&2
@@ -28,7 +40,7 @@ determine_target_user() {
 }
 
 install_sunshine() {
-  local deb_file="/tmp/sunshine-ubuntu-24.04-arm64.deb"
+  local deb_file="/tmp/${SUNSHINE_DEB_ASSET}"
 
   # Check if Sunshine is already installed
   if command -v sunshine >/dev/null 2>&1; then
@@ -38,25 +50,71 @@ install_sunshine() {
 
   echo "Installing Sunshine streaming software..."
 
-  # Fetch the latest release version from GitHub API (including pre-releases)
-  echo "Fetching latest Sunshine release information..."
-  local latest_tag
-  latest_tag=$(curl -s "https://api.github.com/repos/LizardByte/Sunshine/releases" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
-
-  if [[ -z "${latest_tag}" ]]; then
-    echo "Failed to fetch latest Sunshine release information." >&2
-    exit 1
+  # Resolve the release tag, download URL, and expected SHA-256 from the GitHub
+  # Releases API. Defaults to the latest *stable* release (not pre-releases); set
+  # SUNSHINE_VERSION to pin a specific tag for reproducible installs. The expected
+  # SHA-256 comes from the GitHub asset metadata and is verified before install;
+  # override it with SUNSHINE_SHA256 (e.g. for an air-gapped mirror).
+  local api_url release_json
+  if [[ -n "${SUNSHINE_VERSION}" ]]; then
+    api_url="https://api.github.com/repos/LizardByte/Sunshine/releases/tags/${SUNSHINE_VERSION}"
+  else
+    api_url="https://api.github.com/repos/LizardByte/Sunshine/releases/latest"
   fi
 
-  echo "Latest Sunshine release: ${latest_tag}"
-  local sunshine_url="https://github.com/LizardByte/Sunshine/releases/download/${latest_tag}/sunshine-ubuntu-24.04-arm64.deb"
+  echo "Resolving Sunshine release from ${api_url}..."
+  release_json="$(mktemp /tmp/sunshine-release.XXXXXX.json)"
+  curl -fsSL -H 'Accept: application/vnd.github+json' "${api_url}" -o "${release_json}" || {
+    echo "Failed to fetch Sunshine release information from GitHub." >&2
+    rm -f "${release_json}"
+    exit 1
+  }
 
-  # Download Sunshine package
-  echo "Downloading Sunshine from ${sunshine_url}..."
+  local resolved tag sunshine_url expected_sha
+  resolved="$(SUNSHINE_DEB_ASSET="${SUNSHINE_DEB_ASSET}" python3 - "${release_json}" <<'PY'
+import json, os, sys
+
+with open(sys.argv[1]) as fh:
+    data = json.load(fh)
+
+asset_name = os.environ["SUNSHINE_DEB_ASSET"]
+tag = data.get("tag_name", "")
+for asset in data.get("assets", []):
+    if asset.get("name") == asset_name:
+        digest = (asset.get("digest") or "").replace("sha256:", "")
+        print(f"{tag}\t{asset.get('browser_download_url', '')}\t{digest}")
+        break
+else:
+    sys.exit(f"Asset '{asset_name}' not found in Sunshine release '{tag}'.")
+PY
+)" || { echo "Could not locate ${SUNSHINE_DEB_ASSET} in the Sunshine release." >&2; rm -f "${release_json}"; exit 1; }
+  rm -f "${release_json}"
+
+  IFS=$'\t' read -r tag sunshine_url expected_sha <<<"${resolved}"
+  expected_sha="${SUNSHINE_SHA256:-${expected_sha}}"
+
+  echo "Sunshine release: ${tag}"
+  echo "Downloading ${SUNSHINE_DEB_ASSET} from ${sunshine_url}..."
   wget -q --show-progress -O "${deb_file}" "${sunshine_url}" || {
     echo "Failed to download Sunshine package." >&2
     exit 1
   }
+
+  # Verify integrity before installing anything onto the system.
+  if [[ -n "${expected_sha}" ]]; then
+    local actual_sha
+    actual_sha="$(sha256sum "${deb_file}" | cut -d' ' -f1)"
+    if [[ "${actual_sha}" != "${expected_sha}" ]]; then
+      echo "ERROR: SHA-256 mismatch for ${deb_file}" >&2
+      echo "  expected: ${expected_sha}" >&2
+      echo "  actual:   ${actual_sha}" >&2
+      rm -f "${deb_file}"
+      exit 1
+    fi
+    echo "Verified SHA-256: ${actual_sha}"
+  else
+    echo "WARNING: GitHub returned no SHA-256 for ${SUNSHINE_DEB_ASSET}; integrity check skipped." >&2
+  fi
 
   # Install dependencies
   echo "Installing Sunshine dependencies..."
@@ -103,9 +161,6 @@ install_sunshine() {
 }
 
 update_grub_cmdline() {
-  local grub_file="/etc/default/grub"
-  local flags=("nvidia-drm.modeset=1" "nvidia.NVreg_UsePageAttributeTable=1")
-
   python3 - <<'PY'
 import re, shlex
 from pathlib import Path
@@ -257,6 +312,45 @@ EOF
   echo "Installed GNOME autostart entry to set the dummy display and launch Sunshine."
 }
 
+configure_firewall() {
+  if [[ "${CONFIGURE_FIREWALL}" != "1" ]]; then
+    return 0
+  fi
+
+  if ! command -v ufw >/dev/null 2>&1; then
+    echo "CONFIGURE_FIREWALL=1 but ufw is not installed; skipping firewall setup." >&2
+    return 0
+  fi
+
+  if [[ -z "${FIREWALL_ALLOW_CIDRS}" ]]; then
+    echo "CONFIGURE_FIREWALL=1 requires FIREWALL_ALLOW_CIDRS (comma-separated)." >&2
+    echo "Example: FIREWALL_ALLOW_CIDRS=\"172.20.100.0/24,100.64.0.0/10\" (LAN, Tailscale)." >&2
+    echo "Refusing to expose Sunshine to all networks; skipping firewall setup." >&2
+    return 1
+  fi
+
+  # Sunshine default ports (base port 47989). Restricted to the given networks.
+  # See https://docs.lizardbyte.dev/projects/sunshine/latest/ for the port model.
+  local tcp_ports="47984,47989,47990,48010"
+  local udp_ports="47998,47999,48000,48002"
+
+  # Never lock ourselves out of SSH when enabling the firewall.
+  ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp >/dev/null 2>&1 || true
+
+  local cidr
+  local IFS=','
+  for cidr in ${FIREWALL_ALLOW_CIDRS}; do
+    cidr="${cidr// /}"
+    [[ -z "${cidr}" ]] && continue
+    ufw allow from "${cidr}" to any port "${tcp_ports}" proto tcp comment "Sunshine TCP"
+    ufw allow from "${cidr}" to any port "${udp_ports}" proto udp comment "Sunshine UDP"
+    echo "Allowed Sunshine ports from ${cidr}."
+  done
+
+  ufw --force enable
+  echo "Firewall configured (ufw); Sunshine reachable only from: ${FIREWALL_ALLOW_CIDRS}"
+}
+
 main() {
   require_root
   determine_target_user
@@ -265,6 +359,7 @@ main() {
   write_xorg_config
   configure_gdm
   install_autostart
+  configure_firewall
 
   cat <<EOM
 
@@ -273,10 +368,15 @@ Configuration complete. Next steps:
   2. Allow the autologin session to initialize; the GNOME autostart entry will set the 1600x900 mode and launch Sunshine.
   3. Access Sunshine Web UI at: https://$(hostname):47990/ or https://$(hostname -I | awk '{print $1}'):47990/
      IMPORTANT: Use HTTPS (not HTTP) - you will need to accept the self-signed certificate warning.
-  4. Set up your Sunshine username and password on first access.
+  4. SET YOUR SUNSHINE USERNAME AND PASSWORD IMMEDIATELY on first access. Until you do, the
+     web UI is unauthenticated and the first client to reach it can claim the admin account.
   5. Pair Moonlight with this host using the PIN from https://$(hostname):47990/pin
 
-Note: Automatic login is enabled for user "${TARGET_USER}". Adjust /etc/gdm3/custom.conf if you need different credentials.
+Security notes:
+  - Automatic login is enabled for user "${TARGET_USER}". Disable via /etc/gdm3/custom.conf
+    (AutomaticLoginEnable=false) if console access to this machine is a concern.
+  - Sunshine listens on all interfaces. To restrict it to specific networks, re-run with:
+    sudo CONFIGURE_FIREWALL=1 FIREWALL_ALLOW_CIDRS="<LAN/Tailscale CIDRs>" ./configure_headless_sunshine.sh
 EOM
 }
 
